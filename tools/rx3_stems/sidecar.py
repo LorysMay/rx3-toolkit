@@ -26,6 +26,7 @@ MEASURE = "aformat=sample_fmts=fltp,astats=reset=0"
 # Each line carries an ffmpeg `[Parsed_astats_N @ ...]` prefix, so no anchor.
 PEAK_LEVEL = re.compile(r"Peak level dB:\s*(-?\d+(?:\.\d+)?|-?inf)")
 CLIPPED_SAMPLES = re.compile(r"Number of clipped samples:\s*(\d+)")
+RMS_LEVEL = re.compile(r"RMS level dB:\s*(-?\d+(?:\.\d+)?|-?inf)")
 # An mp3 or AAC file declares the samples its encoder prepended, and ffmpeg
 # drops them. The deck does not: `PcmReader` position zero is the first sample
 # its own decoder emits, padding included. A stem cut on ffmpeg's grid
@@ -51,6 +52,9 @@ class SidecarResult:
     seconds: float
     payload_bytes: int
     # Factor applied to return the stem to the gain domain of the source file.
+    # Negative when the separator handed back the stem in anti-phase with the
+    # source: the deck's own `mix - vocal` then corrects the polarity through
+    # the same multiply that corrects the magnitude.
     gain: float = 1.0
     # Samples the container could not hold once that factor was applied.
     clipped: int = 0
@@ -91,6 +95,25 @@ def _peak_amplitude(report: str) -> float | None:
         return None
     loudest = max(levels)
     return 0.0 if loudest == -math.inf else 10.0 ** (loudest / 20.0)
+
+
+def _rms_power(report: str) -> float | None:
+    """Total power implied by every `RMS level dB` line `astats` printed.
+
+    Not a calibrated loudness figure: `astats` prints one line per channel and
+    then an "Overall" line, and this sums all of them, double-counting the
+    signal. That bias is identical for any two reports produced by the same
+    filter graph on the same input duration, which is the only property the
+    one caller of this function relies on - it compares two candidates against
+    each other, never against an absolute threshold.
+    """
+    levels = [
+        -math.inf if value.endswith("inf") else float(value)
+        for value in RMS_LEVEL.findall(report)
+    ]
+    if not levels:
+        return None
+    return sum(0.0 if level == -math.inf else 10.0 ** (level / 10.0) for level in levels)
 
 
 def _encoder_delay(trimmed: pathlib.Path, untrimmed: pathlib.Path) -> int | None:
@@ -208,6 +231,59 @@ def write_sidecar(
             # worse than the one the pinned 1.0 threshold already avoids.
             if separator_normalization and peak and peak > separator_normalization:
                 gain = peak / separator_normalization
+
+            # A model that regresses the complex spectrogram directly, rather
+            # than masking the mixture's own phase, can hand back a stem
+            # 180 degrees out of phase with the source. Played alone it sounds
+            # identical - polarity is inaudible in isolation - but the deck
+            # always computes `mix - vocal`, and subtracting an inverted
+            # vocal *adds* it into the instrumental instead of removing it.
+            # That failure is silent until someone checks the instrumental,
+            # which is exactly the report this is answering.
+            #
+            # The fix is measured the same way the gain above is: build both
+            # candidates the deck could end up computing - mix minus this
+            # stem, and mix plus it - and keep whichever one actually
+            # cancelled energy rather than reinforced it. A correctly-phased
+            # vocal makes `mix - vocal` quieter than `mix + vocal`; an
+            # inverted one makes the opposite true, and the sign in `gain`
+            # corrects it through the same `volume` filter already below.
+            probe = workspace / "vocal.probe.s16le"
+            probe_chain = [f"aresample={SAMPLE_RATE}"]
+            if delay:
+                probe_chain.append(f"adelay=delays={delay}S:all=1")
+            probe_chain.extend(["apad", f"atrim=end_sample={target_frames}"])
+            _decode(ffmpeg, [
+                "-i", str(vocals), "-map", "0:a:0", "-vn",
+                "-af", ",".join(probe_chain), "-ac", str(CHANNELS),
+                "-f", "s16le", str(probe),
+            ])
+
+            def _combined_power(operator: str) -> float | None:
+                # `amix` is not used here: its `weights` option accepts a
+                # negative value and even echoes it back in `-loglevel debug`,
+                # but on this ffmpeg build (6.1.1) the actual sum comes out
+                # identical whether the weight is `1 -1` or `1 1` - verified
+                # by hand, not assumed. `amerge` plus an explicit `pan`
+                # expression has no such option to silently mis-apply.
+                report = _decode(ffmpeg, [
+                    "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+                    "-i", str(full_raw),
+                    "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+                    "-i", str(probe),
+                    "-filter_complex",
+                    f"[0:a][1:a]amerge=inputs=2,"
+                    f"pan=stereo|c0=c0{operator}c2|c1=c1{operator}c3,"
+                    f"{MEASURE}[out]",
+                    "-map", "[out]", "-f", "null", "-",
+                ], report=True)
+                return _rms_power(report)
+
+            subtracted = _combined_power("-")
+            added = _combined_power("+")
+            probe.unlink()
+            if subtracted is not None and added is not None and added < subtracted:
+                gain = -gain
 
         raw = workspace / f"vocal.{ffmpeg_format}"
         arguments = ["-i", str(vocals), "-map", "0:a:0", "-vn"]

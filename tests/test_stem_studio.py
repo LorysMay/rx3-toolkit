@@ -304,6 +304,31 @@ class SidecarGainTests(unittest.TestCase):
             self.assertEqual(result.gain, 1.0)
             self.assertLess(self.worst_error(root / "stem.rx3stem", vocal), 1e-3)
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
+    def test_an_inverted_vocal_stem_has_its_polarity_corrected(self):
+        """A stem 180 degrees out of phase with the source sounds correct
+        alone but doubles into the instrumental once the deck subtracts it,
+        which is only visible from the mix side - so this checks the mix
+        side: `full - corrected_stem` has to land back on the other voice.
+        """
+        full, vocal = self.signals()
+        inverted = b"".join(
+            struct.pack("<ff", *(2 * [-struct.unpack_from("<f", vocal, 8 * i)[0]]))
+            for i in range(self.FRAMES)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            mix_file = self.encode(root, "full", full)
+            stem_file = self.encode(root, "vocal", inverted)
+            result = sidecar.write_sidecar(
+                stem_file, root / "stem.rx3stem", match_full=mix_file,
+                separator_normalization=None,
+            )
+            self.assertEqual(result.gain, -1.0)
+            # Flipped back to the true vocal, not left at the inverted stem
+            # the separator actually returned.
+            self.assertLess(self.worst_error(root / "stem.rx3stem", vocal), 1e-3)
+
     def test_the_peak_is_read_through_the_ffmpeg_line_prefix(self):
         """astats prefixes every line, so an anchored pattern silently reads
         nothing and no correction is ever applied."""

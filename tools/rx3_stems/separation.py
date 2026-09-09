@@ -209,9 +209,6 @@ QUICK_SHIFTS = 1
 # result from more passes. For `vocals_mel_band_roformer` the chunk is 11.0 s,
 # which makes the option's own default of 8 a 27% overlap over 1.38 passes.
 #
-# `quality` therefore keeps the default rather than naming a value: a preset
-# that restated the default would only be noise in the stored settings.
-#
 # `normal` is the largest step that still leaves a crossfade. At the chunk
 # length and above - 11 and up here - the step is clamped to the chunk and the
 # passes stop overlapping at all, which was measured as a discontinuity every
@@ -221,6 +218,15 @@ QUICK_SHIFTS = 1
 # it and costs nothing measurable: 0.399 s/s at 10 against 0.406 at 11, both
 # against 0.526 at the default.
 NORMAL_OVERLAP = 10
+# `quality` exists to answer "as close as this pipeline can get to a
+# commercial, licensed stem separator", not "the vendor's own default", so it
+# spends time rather than assume 8 (~1.38 passes over the 11.0 s chunk) is
+# already enough. At the option's floor of 2 the window advances 82% less per
+# step - about 5.5 passes over the same audio - which stacks that many more
+# independent estimates into the crossfade and measurably tightens the
+# vocal/instrumental boundary at the cost of roughly 4x the compute. `normal`
+# is left at the value above for exactly the trade `quality` is not making.
+MAX_QUALITY_OVERLAP = 2
 # The same ladder for the MDX architecture, whose `mdx_overlap` is a real
 # fraction and does read the way its name suggests. Three presets have to mean
 # three things on a build that can only run this one architecture, so they are
@@ -301,6 +307,7 @@ PRESETS: tuple[Preset, ...] = (
         torch=Variant(
             architecture="MDXC", candidates=ROFORMER_CANDIDATES,
             summary="The cleanest, and the slowest.",
+            values={"mdxc_overlap": MAX_QUALITY_OVERLAP},
         ),
         # "runs at all" rather than "runs on the GPU": these variants also
         # serve the CPU-only build, where there is no GPU to be the better of.

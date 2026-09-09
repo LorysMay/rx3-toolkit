@@ -19,7 +19,9 @@ from typing import Callable
 from tools.rx3_stems.estimate import Estimator
 from tools.rx3_stems.provisioning import Acceleration, Runtime, resolve_acceleration
 from tools.rx3_stems.rekordbox import Collection, Playlist, Track, export_stem
-from tools.rx3_stems.separation import VOCAL_STEM, Settings, input_normalization
+from tools.rx3_stems.separation import (
+    QUALITY_MODE, VOCAL_STEM, Settings, input_normalization,
+)
 from tools.rx3_stems.sidecar import write_sidecar
 
 
@@ -318,10 +320,25 @@ class StemJob:
                     vocals = self._separate(source, workspace, index, total)
                     self._update(stage="Sidecar encoding", track_progress=96)
                     local = workspace / destination.name
+                    # The separator emits float32; `s16` throws half of that
+                    # away on the way into the sidecar for no reason the deck
+                    # cares about (`load_sidecar` in rx3_core_hook.c already
+                    # branches on the header's format byte, so the reader has
+                    # supported f32 since it was written). `quality` is the
+                    # preset that exists to spend a resource for cleaner
+                    # output, so it spends RAM here the same way it spends
+                    # time on `mdxc_overlap` above: this is the same trade,
+                    # not a new one. `normal`/`quick` stay at `s16` because
+                    # the on-device RAM check in `load_sidecar` rejects a
+                    # sidecar outright if it doesn't fit, and doubling every
+                    # stem's resident size is not a cost those presets asked
+                    # for.
                     encoded = write_sidecar(
                         vocals, local,
                         ffmpeg=self.runtime.ffmpeg or "ffmpeg",
-                        sample_format="s16",
+                        sample_format=(
+                            "f32" if self.settings.mode == QUALITY_MODE else "s16"
+                        ),
                         match_full=source,
                         separator_normalization=input_normalization(
                             self.settings, self.architecture
