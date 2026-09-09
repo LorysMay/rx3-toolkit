@@ -173,6 +173,19 @@ ROFORMER_CANDIDATES: tuple[str, ...] = (
     "mel_band_roformer_kim_ft_unwa.ckpt",
     "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
 )
+# `quality`'s ensemble partner for `DEFAULT_MODEL`. A band-split roformer and
+# a mel-band roformer disagree about which frequency axis the network reasons
+# over, so the two rarely mistake the same patch of spectrogram for vocal at
+# once; averaging them cancels more of each one's own error than either
+# corrects alone, which is the same principle every top public leaderboard
+# ensemble is built on. `mel_band_roformer_kim_ft_unwa` is listed second only
+# as a fallback for a catalogue that has withdrawn the band-split model: it is
+# the same family as `DEFAULT_MODEL`, so the two are more likely to share a
+# mistake, but a correlated second opinion still beats none.
+ENSEMBLE_CANDIDATES: tuple[str, ...] = (
+    "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+    "mel_band_roformer_kim_ft_unwa.ckpt",
+)
 # The MDX-Net family: ONNX models of a few tens of megabytes against the
 # roformer's several hundred, for 10.2 dB of vocal SDR against 12.6. They are
 # also band-limited - `dim_f` 3072 over an `n_fft` of 7680 puts the wall at
@@ -256,6 +269,11 @@ class Variant:
     candidates: tuple[str, ...]
     summary: str
     values: dict[str, Any] = field(default_factory=dict)
+    # A second model to average the vocal estimate against. Only set where the
+    # cost is worth it: `quality` on a build that reaches the GPU, never on an
+    # ONNX/CPU fallback that is already the compromise, and never on `normal`
+    # or `quick`, which exist specifically to spend less than `quality` does.
+    ensemble_candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -308,6 +326,7 @@ PRESETS: tuple[Preset, ...] = (
             architecture="MDXC", candidates=ROFORMER_CANDIDATES,
             summary="The cleanest, and the slowest.",
             values={"mdxc_overlap": MAX_QUALITY_OVERLAP},
+            ensemble_candidates=ENSEMBLE_CANDIDATES,
         ),
         # "runs at all" rather than "runs on the GPU": these variants also
         # serve the CPU-only build, where there is no GPU to be the better of.
@@ -477,12 +496,21 @@ class Settings:
     # has been edited by hand. A preset therefore always names exactly one
     # known configuration, and hand tuning is never silently relabelled.
     mode: str = QUALITY_MODE
+    # The second model `model`'s vocal estimate is averaged against, or "" to
+    # run `model` alone. Only ever set by `apply_preset`, which is also the
+    # only place that knows the two are architecturally different enough to
+    # be worth averaging - hand-picking one here would just be a second
+    # `model`, without that guarantee.
+    ensemble: str = ""
 
     def value(self, option: Option) -> Any:
         return self.values.get(option.name, option.default)
 
     def with_model(self, model: str) -> "Settings":
-        return replace(self, model=model, mode=CUSTOM_MODE)
+        # A hand-picked model is not the one `apply_preset` paired an
+        # ensemble partner against, so keeping the pairing would average two
+        # models chosen for unrelated reasons instead of disabling it.
+        return replace(self, model=model, ensemble="", mode=CUSTOM_MODE)
 
     def as_custom(self) -> "Settings":
         """Keep the configuration, stop claiming a preset produced it."""
@@ -548,6 +576,21 @@ def resolve_preset_model(variant: Variant, catalogue: Catalogue) -> str:
     return variant.candidates[0] if variant.candidates else DEFAULT_MODEL
 
 
+def resolve_ensemble_model(variant: Variant, catalogue: Catalogue, primary: str) -> str:
+    """The second model `quality` averages `primary` against, or "" for none.
+
+    Falling back to the catalogue's next-best model of the architecture, the
+    way `resolve_preset_model` does for the primary slot, would risk landing
+    back on `primary` itself - averaging a model with itself is pure waste,
+    not an ensemble - so an unresolved partner disables the ensemble instead
+    of guessing at a substitute.
+    """
+    for candidate in variant.ensemble_candidates:
+        if candidate != primary and catalogue.by_filename(candidate) is not None:
+            return candidate
+    return ""
+
+
 def apply_preset(
     settings: Settings,
     item: Preset,
@@ -562,6 +605,7 @@ def apply_preset(
     """
     variant = item.resolve(accelerates_torch=accelerates_torch)
     model = resolve_preset_model(variant, catalogue)
+    ensemble = resolve_ensemble_model(variant, catalogue, model)
     architecture = catalogue.architecture_of(model) or variant.architecture
     applicable = {
         option.name: option
@@ -574,7 +618,7 @@ def apply_preset(
         name: value for name, value in variant.values.items()
         if name in applicable and value != applicable[name].default
     }
-    return replace(settings, model=model, values=values, mode=item.key)
+    return replace(settings, model=model, ensemble=ensemble, values=values, mode=item.key)
 
 
 def load_settings(path: pathlib.Path) -> Settings:
@@ -585,6 +629,7 @@ def load_settings(path: pathlib.Path) -> Settings:
     model = data.get("model")
     accelerator = data.get("accelerator")
     values = data.get("values")
+    ensemble = data.get("ensemble")
     mode = LEGACY_MODES.get(data.get("mode"), data.get("mode"))
     known = set(known_option_names())
     return Settings(
@@ -593,6 +638,10 @@ def load_settings(path: pathlib.Path) -> Settings:
         # A setting written by a later version must not reach the command line.
         values={key: value for key, value in (values or {}).items() if key in known}
         if isinstance(values, dict) else {},
+        # A settings file from before the ensemble existed has no opinion on
+        # it, which "" already means; `apply_preset` fills it back in on the
+        # next reconciliation the same way it does for `model`.
+        ensemble=ensemble if isinstance(ensemble, str) else "",
         # Settings written before presets existed carry no mode, and describing
         # them as a preset would misreport what they hold. A renamed preset is
         # the other case: the mode is still a preset, just not under the name
@@ -611,6 +660,7 @@ def save_settings(path: pathlib.Path, settings: Settings) -> None:
         "accelerator": settings.accelerator,
         "mode": settings.mode,
         "values": settings.values,
+        "ensemble": settings.ensemble,
     }, indent=2) + "\n", encoding="utf-8")
 
 

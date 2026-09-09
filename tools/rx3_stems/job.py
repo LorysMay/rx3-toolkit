@@ -211,16 +211,35 @@ class StemJob:
             "again for this accelerator, which rebuilds PyTorch for it."
         )
 
-    def _separate(self, source: pathlib.Path, workspace: pathlib.Path, index: int, total: int) -> pathlib.Path:
+    def _run_separator(
+        self, source: pathlib.Path, workspace: pathlib.Path, model: str,
+        index: int, total: int, span: tuple[int, int],
+    ) -> pathlib.Path:
+        """Run audio-separator with `model`, reporting progress across `span`.
+
+        `span` is this call's share of the track's own 0-95 progress window in
+        percentage points, not a fraction: a single, non-ensemble call passes
+        `(0, 95)` and reproduces the old, unscaled mapping from the
+        separator's own percentage exactly; an ensemble's two calls each get a
+        slice of it instead of resetting to 0-100 and appearing to restart.
+        """
         if self.runtime.separator is None:
             raise RuntimeError("audio-separator is not installed")
+        # `arguments()` reads `self.model`, so pairing the ensemble's second
+        # model with the tuning `apply_preset` chose for the first means
+        # asking a `Settings` that names *this* call's model, not editing the
+        # command line by hand.
+        settings = (
+            self.settings if model == self.settings.model
+            else replace(self.settings, model=model)
+        )
         command = [
             str(self.runtime.separator), str(source),
             f"--model_file_dir={self.runtime.models}",
             f"--output_dir={workspace}",
             "--output_format=WAV",
             f"--single_stem={VOCAL_STEM}",
-            *self.settings.arguments(self.architecture),
+            *settings.arguments(self.architecture),
             *self.acceleration.separation_flags,
         ]
         try:
@@ -241,6 +260,7 @@ class StemJob:
         transcript = ""
         head = ""
         last = -1
+        start, end = span
         # tqdm uses carriage returns rather than line feeds. Reading one
         # character at a time preserves live progress updates.
         while True:
@@ -254,7 +274,8 @@ class StemJob:
             if character == "%":
                 match = PERCENT.search(window)
                 if match:
-                    track_progress = min(int(match.group(1)), 95)
+                    raw = min(int(match.group(1)), 100)
+                    track_progress = min(int(start + (end - start) * raw / 100), 95)
                     if track_progress != last:
                         overall = round(((index + track_progress / 100) / total) * 100)
                         self._update(
@@ -282,6 +303,61 @@ class StemJob:
                 f"{failure_detail(transcript)}"
             )
         return candidates[0]
+
+    def _separate(self, source: pathlib.Path, workspace: pathlib.Path, index: int, total: int) -> pathlib.Path:
+        if not self.settings.ensemble:
+            return self._run_separator(
+                source, workspace, self.settings.model, index, total, (0, 95)
+            )
+        # Two independent runs in their own subdirectories: `_run_separator`
+        # identifies its output by being the only WAV under `workspace`, which
+        # a shared directory would break the moment the second run started.
+        primary_dir = workspace / "ensemble-primary"
+        partner_dir = workspace / "ensemble-partner"
+        primary_dir.mkdir()
+        partner_dir.mkdir()
+        primary = self._run_separator(
+            source, primary_dir, self.settings.model, index, total, (0, 47)
+        )
+        partner = self._run_separator(
+            source, partner_dir, self.settings.ensemble, index, total, (47, 94)
+        )
+        self._update(stage="Blending ensemble", track_progress=95)
+        return self._blend(primary, partner, workspace)
+
+    def _blend(
+        self, primary: pathlib.Path, partner: pathlib.Path, workspace: pathlib.Path,
+    ) -> pathlib.Path:
+        """Average two single-model vocal estimates into one.
+
+        Two models with different architectural biases rarely mistake the
+        same patch of spectrogram for vocal at once, so the average cancels
+        more of each one's own error than either corrects alone - the
+        principle every public separation leaderboard's own ensemble entries
+        are built on.
+
+        `amix`'s `weights` option is not used here: this project measured it
+        to silently ignore a negative weight on this ffmpeg build while still
+        echoing the value back at `-loglevel debug`, and a positive 0.5/0.5
+        pair was never checked closely enough to trust either. `pan` with an
+        explicit coefficient has no option to mis-apply - it does arithmetic,
+        not a filter-specific weighting scheme - so the same approach used for
+        the polarity check in `sidecar.py` is used again here.
+        """
+        blended = workspace / "vocal.ensemble.wav"
+        ffmpeg = str(self.runtime.ffmpeg or "ffmpeg")
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+             "-i", str(primary), "-i", str(partner),
+             "-filter_complex",
+             "[0:a][1:a]amerge=inputs=2,pan=stereo|c0=0.5*c0+0.5*c2|c1=0.5*c1+0.5*c3",
+             "-c:a", "pcm_f32le", str(blended)],
+            capture_output=True, text=True,
+        )
+        if result.returncode:
+            detail = " ".join((result.stderr or result.stdout).split())[-260:]
+            raise RuntimeError(f"ffmpeg could not blend the ensemble stems: {detail}")
+        return blended
 
     def _process_track(
         self,

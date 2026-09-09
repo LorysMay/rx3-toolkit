@@ -352,6 +352,72 @@ class SidecarGainTests(unittest.TestCase):
             self.assertIsNone(separation.input_normalization(settings, architecture))
 
 
+class EnsembleBlendTests(unittest.TestCase):
+    """`_blend` is what stands between the ensemble and the `amix` weight bug
+    already found once in `sidecar.py` - the same class of mistake here would
+    quietly average nothing, or double one input, instead of raising."""
+
+    RATE = 44100
+    FRAMES = RATE // 5
+
+    def job(self) -> StemJob:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            audio = root / "Artist - Track.aiff"
+            audio.write_bytes(b"fixture")
+            xml = write_export(root, [("1", "Track", "Artist", audio)])
+            collection = parse_collection(xml)
+            return StemJob(
+                provisioning.detect(), collection, collection.playlists[0], root / "out"
+            )
+
+    def encode(self, root: pathlib.Path, name: str, value: float) -> pathlib.Path:
+        """A constant-amplitude tone, so the correct blend is `value` exactly
+        and any bug that skips, doubles, or zeroes an input is visible at a
+        single sample rather than needing a spectrum to notice."""
+        samples = bytearray()
+        for index in range(self.FRAMES):
+            level = value * math.sin(2 * math.pi * 440 * index / self.RATE)
+            samples += struct.pack("<ff", level, level)
+        raw = root / f"{name}.f32"
+        raw.write_bytes(bytes(samples))
+        wav = root / f"{name}.wav"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "f32le",
+             "-ar", str(self.RATE), "-ac", "2", "-i", str(raw), "-c:a", "pcm_f32le",
+             str(wav)],
+            check=True,
+        )
+        return wav
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required")
+    def test_two_candidates_are_averaged_not_summed_or_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            primary = self.encode(root, "primary", 0.4)
+            partner = self.encode(root, "partner", 0.8)
+
+            blended = self.job()._blend(primary, partner, root)
+
+            raw = root / "blended.f32"
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(blended), "-f", "f32le", str(raw)],
+                check=True,
+            )
+            payload = raw.read_bytes()
+            samples = [
+                struct.unpack_from("<f", payload, 4 * index)[0]
+                for index in range(0, 2 * self.FRAMES, 14)
+            ]
+            expected = [
+                0.6 * math.sin(2 * math.pi * 440 * (index // 2) / self.RATE)
+                for index in range(0, 2 * self.FRAMES, 14)
+            ]
+            for got, want in zip(samples, expected):
+                self.assertAlmostEqual(got, want, places=3)
+
+
 class SidecarAlignmentTests(unittest.TestCase):
     """The deck indexes the sidecar by the position of its own decoder, which
     plays the encoder padding that ffmpeg drops on the way into the separator."""
